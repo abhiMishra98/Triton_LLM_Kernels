@@ -1,6 +1,6 @@
 # FlashAttention
 
-A tiled, Triton-JIT'd FlashAttention-2 forward pass for a single sequence and head, with an online softmax so the full `seq_len x seq_len` score matrix is never materialized.
+A tiled, Triton-JIT'd FlashAttention-2 forward pass for a single sequence and head, using an online softmax so the full `seq_len x seq_len` score matrix is never materialized.
 
 ## Table of Contents
 
@@ -13,7 +13,7 @@ A tiled, Triton-JIT'd FlashAttention-2 forward pass for a single sequence and he
 
 ## Background
 
-`flash_attn_fwd_kernel` computes attention for `Q, K, V: (seq_len, head_dim)` using the FlashAttention-2 strategy: each program instance owns a `BLOCK_M`-sized tile of queries and streams `K`/`V` in `BLOCK_N`-sized tiles, keeping a running max (`m_i`) and running denominator (`l_i`) per query row. The output accumulator is rescaled in place whenever the running max updates, and the division by `l_i` is deferred to the very end — this is what lets the kernel skip storing the full attention matrix while still producing an exact (not approximate) softmax. Padding masks on the loads and store make the kernel correct even when `seq_len` isn't a multiple of the block sizes; an optional causal mode further restricts each query tile to the keys at or before it.
+`flash_attn_fwd_kernel` computes attention for `Q, K, V: (seq_len, head_dim)` using the FlashAttention-2 strategy. Each program instance owns a `BLOCK_M`-sized tile of queries and streams `K`/`V` in `BLOCK_N`-sized tiles, keeping a running max (`m_i`) and running denominator (`l_i`) per query row. The output accumulator is rescaled whenever the running max updates, and division by `l_i` is deferred to the end. This avoids storing the full attention matrix while still producing an exact softmax. Padding masks on the loads and store keep the kernel correct when `seq_len` is not a multiple of the block sizes. An optional causal mode restricts each query tile to keys at or before it.
 
 ## Install
 
@@ -63,7 +63,7 @@ Beyond the baseline online-softmax loop, four optimizations are applied:
 
 ## Benchmarks
 
-**Correctness** (`seq_len=256, head_dim=64`, vs. an unfused fp32 PyTorch reference): max abs diff `~2e-4` (non-causal) / `~2e-3` (causal), both well under the `1e-2` tolerance used for fp16.
+**Correctness** (`seq_len=256, head_dim=64`, vs. an unfused fp32 PyTorch reference): max abs diff `~2e-4` (non-causal) / `~2e-3` (causal), both under the `1e-2` tolerance used for fp16.
 
 **Latency vs. SDPA** (causal, fp16, `head_dim=64`, single head, on an NVIDIA L40S):
 
@@ -74,11 +74,11 @@ Beyond the baseline online-softmax loop, four optimizations are applied:
 |    2048 |      0.0391 |    0.0193 |   0.49x |
 |    4096 |      0.0734 |    0.0305 |   0.42x |
 
-SDPA (cuDNN/CUTLASS-backed, warp-specialized) pulls further ahead as `seq_len` grows — expected for a fixed `BLOCK_M = BLOCK_N = 64` reference kernel vs. a production-tuned one.
+SDPA (cuDNN/CUTLASS-backed, warp-specialized) pulls further ahead as `seq_len` grows, as expected for a fixed `BLOCK_M = BLOCK_N = 64` reference kernel compared to a production-tuned one.
 
-### Why the causal tile-skip doesn't show up at these sizes
+### Why the causal tile skip doesn't show up at these sizes
 
-Benchmarking causal vs. non-causal at the *same* `seq_len` (instead of vs. SDPA) exposes a load-balancing artifact:
+Comparing causal vs. non-causal at the same `seq_len` (instead of vs. SDPA) exposes a load-balancing issue:
 
 | seq_len | grid (programs) | causal (ms) | non-causal (ms) | ratio |
 |--------:|-----------------:|------------:|-----------------:|------:|
@@ -87,9 +87,9 @@ Benchmarking causal vs. non-causal at the *same* `seq_len` (instead of vs. SDPA)
 |   16384 |              256 |      0.2988 |           0.3827 |  0.78 |
 |   32768 |              512 |      1.0257 |           1.5808 |  0.65 |
 
-The tile-skip logic is algorithmically correct — it halves the average number of K/V tiles visited — but the grid is one CTA per `BLOCK_M`-sized query tile with no work redistribution. When the grid fits in a single wave of the GPU's SMs (L40S has 142 SMs; `seq_len=4096` → 64 programs), wall-clock time is set by the *slowest* program in that wave, and for causal attention that's the last query tile, which still walks almost the entire K/V range — same as non-causal. The savings from the early, cheap tiles are hidden by that straggler. Only once the grid exceeds one wave (`seq_len >= 16384`) does the aggregate FLOP reduction start cutting the number of waves needed, and the ratio drops toward the expected ~0.5.
+The tile-skip logic is correct — it halves the average number of K/V tiles visited — but the grid launches one CTA per `BLOCK_M`-sized query tile with no work redistribution. When the grid fits in a single wave of the GPU's SMs (L40S has 142 SMs; `seq_len=4096` gives 64 programs), wall-clock time is set by the slowest program in that wave. For causal attention that is the last query tile, which still walks almost the entire K/V range, same as non-causal. Savings from the earlier, cheaper tiles are hidden by that straggler. Only once the grid exceeds one wave (`seq_len >= 16384`) does the FLOP reduction start cutting the number of waves needed, and the ratio drops toward the expected ~0.5.
 
-This is why production FlashAttention kernels don't use a plain `pid_m` grid for causal attention — they interleave/swizzle query-tile assignment across CTAs (or split each tile's K/V range across multiple CTAs and reduce afterward, à la flash-decoding) so every wave is balanced regardless of grid size. Not implemented here — noted as a follow-up.
+Production FlashAttention kernels avoid this by interleaving/swizzling query-tile assignment across CTAs, or splitting each tile's K/V range across multiple CTAs and reducing afterward (as in flash-decoding), so every wave is balanced regardless of grid size. Not implemented here.
 
 ### Possible follow-ups
 
